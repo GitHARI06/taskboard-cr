@@ -28,7 +28,7 @@ def create_project(data: ProjectCreate, db: Session = Depends(get_db), user: Use
     return project
 
 
-@router.get("/projects/{project_id}/members", response_model=list[MemberOut])
+@router.get("/projects/{project_id}/collaborators", response_model=list[MemberOut])
 def list_members(project_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     project = get_project_for(db, project_id, user)
     owner = db.get(User, project.owner_id)
@@ -38,7 +38,7 @@ def list_members(project_id: int, db: Session = Depends(get_db), user: User = De
     return members
 
 
-@router.post("/projects/{project_id}/members", response_model=MemberOut, status_code=status.HTTP_201_CREATED)
+@router.post("/projects/{project_id}/collaborators", response_model=MemberOut, status_code=status.HTTP_201_CREATED)
 def add_member(
     project_id: int, data: MemberAdd, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
