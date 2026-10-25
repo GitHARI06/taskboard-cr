@@ -2,9 +2,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 from app import settings
 from app.db import Base, engine
+from app.limits import limiter
 from app.routers import auth, comments, notifications, projects, tasks
 
 
@@ -15,6 +18,8 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="TaskBoard API", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
