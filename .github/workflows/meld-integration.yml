@@ -1,0 +1,355 @@
+# Meld integration check
+#
+# Save as .github/workflows/meld-integration.yml in your project.
+#
+# On every pull request (and push to main) this starts your docker compose
+# stack on a GitHub-hosted runner, checks every service came up, requests the
+# backend's endpoints, and reports the results to Meld. The job fails when
+# something is broken, so the PR gets a red check.
+#
+# Meld only sends this job a list of URL paths to request; it never sends code.
+# It authenticates with GitHub's OIDC token, so no secrets are needed. Pull
+# requests from forks don't get OIDC tokens: they still run the checks, but
+# results are only shown in the job log.
+name: Meld integration check
+
+on:
+  pull_request:
+  push:
+    branches: [main]  # your default branch
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MELD_URL: https://74-225-232-186.sslip.io
+      # Where the backend answers once the stack is up (a port your compose file publishes).
+      MELD_BACKEND_URL: http://localhost:8000
+      # Optional: the frontend's published URL, to check that it serves too.
+      MELD_FRONTEND_URL: http://localhost:3000
+      MELD_COMPOSE_FILE: docker-compose.yml
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use example environment
+        # Compose files often interpolate variables from .env, which isn't committed.
+        run: if [ ! -f .env ] && [ -f .env.example ]; then cp .env.example .env; fi
+
+      - name: Start the stack
+        continue-on-error: true
+        # Output is kept so a build failure (e.g. a dependency that won't install) reaches the report.
+        run: docker compose -f "$MELD_COMPOSE_FILE" up --detach --build --wait --wait-timeout 300 2>&1 | tee "$RUNNER_TEMP/meld-compose-up.log"; exit "${PIPESTATUS[0]}"
+
+      - name: Probe the stack and report to Meld
+        run: |
+          python3 - <<'MELD_PROBE'
+          import http.cookiejar
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          MELD_URL = os.environ.get("MELD_URL", "").rstrip("/")
+          BACKEND = os.environ.get("MELD_BACKEND_URL", "http://localhost:8000").rstrip("/")
+          FRONTEND = os.environ.get("MELD_FRONTEND_URL", "").rstrip("/")
+          COMPOSE = ["docker", "compose", "-f", os.environ.get("MELD_COMPOSE_FILE", "docker-compose.yml")]
+          UP_LOG = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "meld-compose-up.log")
+          NETWORK_ERRORS = (urllib.error.URLError, OSError, ValueError)
+          # Requests to the app share cookies and the login token, like a signed-in browser.
+          COOKIES = http.cookiejar.CookieJar()
+          BACKEND_OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(COOKIES))
+          BACKEND_HEADERS = {}
+          REPLAY_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
+
+
+          def request(method, url, payload=None, headers=None, timeout=15, opener=None, form=False):
+              headers = dict(headers or {})
+              data = None
+              if payload is not None and form:
+                  data = urllib.parse.urlencode(payload).encode()
+                  headers["Content-Type"] = "application/x-www-form-urlencoded"
+              elif payload is not None:
+                  data = json.dumps(payload).encode()
+                  headers["Content-Type"] = "application/json"
+              req = urllib.request.Request(url, data=data, method=method, headers=headers)
+              try:
+                  with (opener.open if opener else urllib.request.urlopen)(req, timeout=timeout) as resp:
+                      return resp.status, resp.read()
+              except urllib.error.HTTPError as exc:
+                  return exc.code, exc.read()
+
+
+          def own_path(path):
+              """Only ever request paths on our own backend."""
+              return isinstance(path, str) and path.startswith("/") and not path.startswith("//")
+
+
+          def backend(method, path, payload=None, form=False):
+              return request(method, BACKEND + path, payload, BACKEND_HEADERS, opener=BACKEND_OPENER, form=form)
+
+
+          def escape(text, title=False):
+              text = str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              return text.replace(":", "%3A").replace(",", "%2C") if title else text
+
+
+          def annotate(level, title, message):
+              print("::%s title=%s::%s" % (level, escape(title, True), escape(message)))
+
+
+          def oidc_token():
+              url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
+              bearer = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+              if not (url and bearer and MELD_URL):
+                  return None
+              sep = "&" if "?" in url else "?"
+              try:
+                  status, body = request("GET", url + sep + "audience=" + urllib.parse.quote(MELD_URL, safe=""),
+                                         headers={"Authorization": "Bearer " + bearer})
+                  return json.loads(body)["value"] if status == 200 else None
+              except NETWORK_ERRORS + (KeyError,):
+                  return None
+
+
+          def service_logs(name):
+              logs = subprocess.run(COMPOSE + ["logs", "--no-color", "--tail", "60", name],
+                                    capture_output=True, text=True, timeout=60)
+              # Apps colour their own log lines (e.g. werkzeug); strip ANSI escapes.
+              return re.sub(r"\x1b\[[0-9;]*m", "", logs.stdout + logs.stderr)[-4000:]
+
+
+          def service_failed(service):
+              if service["health"] == "unhealthy":
+                  return True
+              if service["state"] == "exited":
+                  return service["exit_code"] not in (0, "0")
+              return service["state"] != "running"
+
+
+          def compose_state():
+              try:
+                  out = subprocess.run(COMPOSE + ["ps", "--all", "--format", "json"],
+                                       capture_output=True, text=True, timeout=60)
+              except (OSError, subprocess.TimeoutExpired) as exc:
+                  return {"error": str(exc), "services": []}
+              if out.returncode != 0:
+                  return {"error": out.stderr.strip()[-2000:], "services": []}
+              text = out.stdout.strip()
+              # Compose prints a JSON array (older) or one JSON object per line (newer).
+              items = json.loads(text) if text.startswith("[") else [json.loads(l) for l in text.splitlines() if l.strip()]
+              services = []
+              for item in items:
+                  service = {
+                      "name": item.get("Service") or item.get("Name"),
+                      "state": str(item.get("State", "")).lower(),
+                      "health": str(item.get("Health", "")).lower(),
+                      "exit_code": item.get("ExitCode"),
+                  }
+                  if service_failed(service):
+                      service["logs"] = service_logs(service["name"])
+                  services.append(service)
+              if services:
+                  return {"error": None, "services": services}
+              # Nothing was created: the reason (usually a failed image build) is in the `up` output.
+              try:
+                  with open(UP_LOG, encoding="utf-8", errors="replace") as handle:
+                      return {"error": "no services were created:\n" + handle.read()[-3000:], "services": []}
+              except OSError:
+                  return {"error": "no services were created", "services": []}
+
+
+          def wait_for(url, seconds):
+              deadline = time.time() + seconds
+              while time.time() < deadline:
+                  try:
+                      request("GET", url, timeout=5)
+                      return True
+                  except NETWORK_ERRORS:
+                      time.sleep(2)
+              return False
+
+
+          def probe(path, origin):
+              started = time.time()
+              entry = {"method": "GET", "path": path, "from": origin, "status": None}
+              try:
+                  entry["status"], body = backend("GET", path)
+                  if entry["status"] >= 500:
+                      entry["body"] = body[:1500].decode("utf-8", "replace")
+              except NETWORK_ERRORS as exc:
+                  entry["error"] = str(getattr(exc, "reason", exc))
+              entry["ms"] = int((time.time() - started) * 1000)
+              return entry
+
+
+          def probe_failed(entry):
+              status = entry["status"]
+              return status is None or status >= 500 or (status == 404 and entry["from"] == "plan")
+
+
+          def sign_in(plan):
+              """Register a throwaway user and log in through the app's own routes, keeping the token/cookie."""
+              outcome = {"attempted": True, "authenticated": False}
+              register, login = plan.get("register"), plan.get("login") or {}
+              try:
+                  if register and own_path(register.get("path")):
+                      outcome["register_status"] = backend("POST", register["path"], register.get("body") or {})[0]
+                  if not own_path(login.get("path")):
+                      return outcome
+                  status, body = backend("POST", login["path"], login.get("body") or {}, form=bool(login.get("form")))
+                  outcome["login_status"] = status
+                  outcome["response"] = body[:800].decode("utf-8", "replace") if status >= 400 else ""
+                  data = json.loads(body) if status < 400 and body else {}
+                  data = data if isinstance(data, dict) else {}
+                  for holder in (data, data.get("data") if isinstance(data.get("data"), dict) else {}):
+                      token = next((holder[k] for k in ("access_token", "token", "accessToken", "jwt", "id_token")
+                                    if isinstance(holder.get(k), str)), None)
+                      if token:
+                          BACKEND_HEADERS["Authorization"] = "Bearer " + token
+                          break
+                  outcome["authenticated"] = status < 400 and ("Authorization" in BACKEND_HEADERS or len(COOKIES) > 0)
+              except NETWORK_ERRORS as exc:
+                  outcome["response"] = str(exc)
+              return outcome
+
+
+          def replay(item):
+              """Send one of the frontend's calls, exactly as Meld planned it, and keep the backend's answer."""
+              entry = {key: item.get(key) for key in ("method", "path", "body", "source", "route")}
+              entry["status"] = None
+              try:
+                  status, body = backend(item["method"], item["path"], item.get("body"))
+                  entry["status"] = status
+                  if status >= 400:
+                      entry["response"] = body[:2000].decode("utf-8", "replace")
+              except NETWORK_ERRORS as exc:
+                  entry["error"] = str(getattr(exc, "reason", exc))
+              return entry
+
+
+          def main():
+              token = oidc_token()
+              auth = {"Authorization": "Bearer " + token} if token else None
+              if not auth:
+                  annotate("warning", "Meld", "No OIDC token (fork PR, missing `id-token: write`, or MELD_URL unset); "
+                                              "checks run but results are not sent to Meld.")
+
+              results = {"sha": os.environ.get("GITHUB_SHA", ""), "backend_url": BACKEND,
+                         "compose": compose_state(), "probes": [], "replays": [], "auth": None,
+                         "openapi": None, "frontend": None}
+              results["backend_ready"] = wait_for(BACKEND, 90)
+
+              plan = {}
+              if auth:
+                  try:
+                      status, body = request("POST", MELD_URL + "/api/ci/plan", {}, auth, timeout=120)
+                      if status == 200:
+                          plan = json.loads(body)
+                      else:
+                          annotate("warning", "Meld", "Probe plan request failed with HTTP %s" % status)
+                  except NETWORK_ERRORS as exc:
+                      annotate("warning", "Meld", "Could not reach Meld for a probe plan: %s" % exc)
+
+              if results["backend_ready"]:
+                  try:
+                      status, body = backend("GET", "/openapi.json")
+                      spec = json.loads(body) if status == 200 else None
+                      if isinstance(spec, dict) and isinstance(spec.get("paths"), dict):
+                          results["openapi"] = spec
+                  except NETWORK_ERRORS:
+                      pass
+                  if isinstance(plan.get("auth"), dict):
+                      results["auth"] = sign_in(plan["auth"])
+                  # The frontend's own calls, with the bodies it sends.
+                  for item in plan.get("replays") or []:
+                      if (isinstance(item, dict) and item.get("method") in REPLAY_METHODS and own_path(item.get("path"))
+                              and (item.get("body") is None or isinstance(item.get("body"), dict))):
+                          results["replays"].append(replay(item))
+                  seen = {r["path"] for r in results["replays"] if r["method"] == "GET"}
+                  for item in plan.get("probes") or []:
+                      path = item.get("path")
+                      if own_path(path) and path not in seen:
+                          seen.add(path)
+                          entry = probe(path, "plan")
+                          entry["source"] = item.get("source")
+                          results["probes"].append(entry)
+                  for path, operations in sorted(((results["openapi"] or {}).get("paths") or {}).items()):
+                      if "get" in operations and "{" not in path and path not in seen and len(results["probes"]) < 60:
+                          seen.add(path)
+                          results["probes"].append(probe(path, "openapi"))
+
+              # A 5xx page rarely says why; the traceback is in the server's log.
+              if any(e["status"] is None or e["status"] >= 500 for e in results["probes"] + results["replays"]):
+                  for service in results["compose"]["services"]:
+                      if "logs" not in service:
+                          service["logs"] = service_logs(service["name"])
+
+              if FRONTEND:
+                  entry = {"url": FRONTEND, "status": None}
+                  if wait_for(FRONTEND, 60):
+                      try:
+                          entry["status"] = request("GET", FRONTEND)[0]
+                      except NETWORK_ERRORS as exc:
+                          entry["error"] = str(exc)
+                  else:
+                      entry["error"] = "no response within 60s"
+                  results["frontend"] = entry
+
+              if len(json.dumps(results)) > 1500000:
+                  results["openapi"] = None
+                  annotate("warning", "Meld", "OpenAPI spec too large to upload; skipped.")
+
+              if results["auth"]:
+                  print("sign-in: %s" % ("ok" if results["auth"]["authenticated"] else "failed (%s)" % results["auth"]))
+              for entry in results["replays"]:
+                  print("%-6s %-6s %-44s %s" % (entry["status"] or "ERR", entry["method"], entry["path"], entry.get("source") or ""))
+              for entry in results["probes"]:
+                  print("%-6s GET    %-44s %s" % (entry["status"] or "ERR", entry["path"], entry.get("error") or ""))
+
+              report = None
+              if auth:
+                  try:
+                      status, body = request("POST", MELD_URL + "/api/ci/results", results, auth, timeout=180)
+                      report = json.loads(body) if status == 200 else None
+                      if report is None:
+                          annotate("warning", "Meld", "Reporting results failed with HTTP %s" % status)
+                  except NETWORK_ERRORS as exc:
+                      annotate("warning", "Meld", "Could not report results to Meld: %s" % exc)
+
+              if report:
+                  print(report.get("summary", ""))
+                  for risk in report.get("risks", []):
+                      annotate("error" if risk.get("level") == "HIGH" else "warning", risk.get("title"), risk.get("message"))
+                  return 1 if report.get("failed") else 0
+
+              # Meld unavailable: fail on what this job can see by itself.
+              compose = results["compose"]
+              problems = ([compose["error"]] if compose["error"] else []) + [
+                  "service %s is %s" % (s["name"], s["state"]) for s in compose["services"] if service_failed(s)
+              ] + ["GET %s -> %s" % (e["path"], e["status"] or e.get("error")) for e in results["probes"] if probe_failed(e)] + [
+                  "%s %s (%s) -> %s" % (e["method"], e["path"], e["source"], e["status"] or e.get("error"))
+                  for e in results["replays"] if e["status"] is None or e["status"] >= 500
+              ]
+              if not results["backend_ready"]:
+                  problems.append("backend did not answer at " + BACKEND)
+              for problem in problems:
+                  annotate("error", "Integration check", problem)
+              return 1 if problems else 0
+
+
+          sys.exit(main())
+          MELD_PROBE
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose -f "$MELD_COMPOSE_FILE" down --volumes
