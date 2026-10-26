@@ -57,6 +57,15 @@ def test_members_and_notifications(client):
     assert "Ada added you to Launch" in messages
 
 
+def test_deleting_a_task_removes_its_comments(client):
+    headers = sign_up(client)
+    project_id = make_project(client, headers)
+    task = client.post("/api/tasks", json={"project_id": project_id, "title": "Ship"}, headers=headers).json()
+    client.post(f"/api/tasks/{task['id']}/comments", json={"body": "Done?"}, headers=headers)
+    assert client.delete(f"/api/tasks/{task['id']}", headers=headers).status_code == 204
+    assert client.get(f"/api/task/{task['id']}", headers=headers).status_code == 404
+
+
 def test_outsiders_cannot_see_projects(client):
     owner = sign_up(client)
     stranger = sign_up(client, email="eve@example.com", name="Eve")
