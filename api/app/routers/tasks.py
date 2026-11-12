@@ -1,12 +1,12 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user
 from app.db import get_db
-from app.models import Task, User
+from app.models import Comment, Task, User
 from app.schemas import TaskCreate, TaskOut, TaskUpdate
 from app.services.access import get_project_for, get_task_for, visible_project_ids
 from app.services.notify import notify
@@ -77,6 +77,7 @@ def update_task(
 @router.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_task(task_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     task = get_task_for(db, task_id, user)
+    db.execute(delete(Comment).where(Comment.task_id == task.id))
     db.delete(task)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
