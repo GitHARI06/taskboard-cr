@@ -43,9 +43,9 @@ def test_members_and_notifications(client):
     owner = sign_up(client)
     bob = sign_up(client, email="bob@example.com", name="Bob")
     project_id = make_project(client, owner)
-    r = client.post(f"/api/projects/{project_id}/members", json={"email": "bob@example.com"}, headers=owner)
+    r = client.post(f"/api/projects/{project_id}/collaborators", json={"email": "bob@example.com"}, headers=owner)
     assert r.status_code == 201, r.text
-    members = client.get(f"/api/projects/{project_id}/members", headers=bob).json()
+    members = client.get(f"/api/projects/{project_id}/collaborators", headers=bob).json()
     assert {m["name"] for m in members} == {"Ada", "Bob"}
 
     task = client.post("/api/tasks", json={"project_id": project_id, "title": "Ship"}, headers=owner).json()
@@ -70,4 +70,4 @@ def test_outsiders_cannot_see_projects(client):
     owner = sign_up(client)
     stranger = sign_up(client, email="eve@example.com", name="Eve")
     project_id = make_project(client, owner)
-    assert client.get(f"/api/projects/{project_id}/members", headers=stranger).status_code == 404
+    assert client.get(f"/api/projects/{project_id}/collaborators", headers=stranger).status_code == 404

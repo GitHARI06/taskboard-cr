@@ -12,11 +12,11 @@ export async function createProject(name: string): Promise<Project> {
 }
 
 export async function listMembers(projectId: number): Promise<Member[]> {
-  const res = await api.get(`/projects/${projectId}/members`);
+  const res = await api.get(`/projects/${projectId}/collaborators`);
   return res.data;
 }
 
 export async function addMember(projectId: number, email: string, role = "member"): Promise<Member> {
-  const res = await api.post(`/projects/${projectId}/members`, { email, role });
+  const res = await api.post(`/projects/${projectId}/collaborators`, { email, role });
   return res.data;
 }
