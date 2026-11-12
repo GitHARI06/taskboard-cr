@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      MELD_URL: https://74-225-232-186.sslip.io
+      MELD_URL: https://usemeld.dev
       # Where the backend answers once the stack is up (a port your compose file publishes).
       MELD_BACKEND_URL: http://localhost:8000
       # Optional: the frontend's published URL, to check that it serves too.
